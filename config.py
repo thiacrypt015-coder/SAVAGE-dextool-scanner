@@ -1,7 +1,9 @@
 import os
+import re
 import logging
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
+from urllib.parse import urlparse, urlunparse, parse_qsl, urlencode
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -29,7 +31,53 @@ PRIVATE_KEY: str = _env("PRIVATE_KEY", required=True)
 ENCRYPTION_KEY: str = _env("ENCRYPTION_KEY", required=True)
 
 RPC_URL_SOL: str = _env("RPC_URL_SOL", default="https://api.mainnet-beta.solana.com")
-RPC_URLS_SOL: list[str] = [u.strip() for u in RPC_URL_SOL.split(",") if u.strip()]
+
+_HELIUS_HOSTS = ("mainnet.helius-rpc.com", "rpc.helius.xyz", "devnet.helius-rpc.com")
+_UUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+
+
+def _normalize_rpc_url(url: str) -> str:
+    """Auto-fix common Helius URL mistakes: '?KEY' or '?key=KEY' -> '?api-key=KEY'."""
+    raw = url.strip()
+    if not raw:
+        return raw
+    try:
+        parsed = urlparse(raw)
+        host = (parsed.hostname or "").lower()
+        if host not in _HELIUS_HOSTS:
+            return raw
+        qs = parse_qsl(parsed.query, keep_blank_values=True)
+        if any(k.lower() == "api-key" and v for k, v in qs):
+            return raw
+        rewritten = []
+        moved = False
+        for k, v in qs:
+            if not moved and k.lower() in ("key", "apikey", "api_key") and v:
+                rewritten.append(("api-key", v))
+                moved = True
+            else:
+                rewritten.append((k, v))
+        if moved:
+            new_query = urlencode(rewritten)
+            return urlunparse(parsed._replace(query=new_query))
+        if len(qs) == 1 and qs[0][1] == "" and _UUID_RE.match(qs[0][0]):
+            new_query = urlencode([("api-key", qs[0][0])])
+            return urlunparse(parsed._replace(query=new_query))
+        return raw
+    except Exception:
+        return raw
+
+
+def _mask_rpc_url(url: str) -> str:
+    if not url:
+        return ""
+    return re.sub(r"(api[-_]?key=)[^&]+", r"\1***", url, flags=re.IGNORECASE)
+
+
+_RPC_URL_SOL_RAW = RPC_URL_SOL
+RPC_URL_SOL = ",".join(_normalize_rpc_url(u.strip()) for u in RPC_URL_SOL.split(",") if u.strip())
+RPC_URLS_SOL: list[str] = [u for u in RPC_URL_SOL.split(",") if u]
+RPC_URL_SOL_REWRITTEN: bool = _RPC_URL_SOL_RAW != RPC_URL_SOL
 RPC_URL_ETH: str = _env("RPC_URL_ETH", default="")
 RPC_URL_BSC: str = _env("RPC_URL_BSC", default="")
 
@@ -190,3 +238,10 @@ def _build_logger() -> logging.Logger:
 
 
 logger = _build_logger()
+
+if RPC_URL_SOL_REWRITTEN:
+    logger.warning(
+        "RPC_URL_SOL was auto-fixed to add 'api-key=' — original env value used a malformed Helius URL. "
+        "Update the env var to %s for clarity.",
+        RPC_URL_SOL,
+    )

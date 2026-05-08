@@ -220,15 +220,24 @@ class SolanaTrader:
         self.wallet = str(self.keypair.pubkey())
         logger.info("SolanaTrader initialised – wallet %s", self.wallet)
 
-    async def get_balance(self) -> float:
+    async def get_balance(self, raise_on_error: bool = False) -> float:
         try:
             resp = await _rpc_call_with_failover(
                 lambda c: c.get_balance(self.keypair.pubkey())
             )
             return resp.value / 1e9
         except Exception as exc:
-            logger.error("get_balance error: %s", exc)
+            logger.error("get_balance error for %s: %s", self.wallet, exc)
+            if raise_on_error:
+                raise
             return 0.0
+
+    async def try_get_balance(self) -> tuple[float, str | None]:
+        try:
+            return await self.get_balance(raise_on_error=True), None
+        except Exception as exc:
+            msg = str(exc) or getattr(exc, "error_msg", "") or repr(exc)
+            return 0.0, msg[:200]
 
     async def get_token_balance(self, token_mint: str) -> tuple[float, int]:
         try:
@@ -442,6 +451,24 @@ class SolanaTrader:
         logger.error("buy_token failed after retries for %s: %s", token_mint, last_error)
         return None
 
+    async def buy_token_with_reason(self, token_mint: str, amount_sol: float) -> dict:
+        bal, err = await self.try_get_balance()
+        if err:
+            return {"success": False, "reason": f"RPC error reading balance: {err[:120]}"}
+        fee_reserve = 0.005
+        if bal < amount_sol + fee_reserve:
+            return {
+                "success": False,
+                "reason": (
+                    f"Insufficient balance — wallet has {bal:.6f} SOL, "
+                    f"need {amount_sol + fee_reserve:.6f} SOL ({amount_sol:.4f} buy + {fee_reserve} fee reserve)."
+                ),
+            }
+        result = await self.buy_token(token_mint, amount_sol)
+        if result is None:
+            return {"success": False, "reason": "Swap failed — see logs (likely Jupiter quote/swap error or RPC issue)."}
+        return {"success": True, **result}
+
     async def sell_token(self, token_mint: str, token_amount_raw: int, decimals: int = 9) -> dict | None:
         try:
             slippage_bps = SLIPPAGE * 100
@@ -592,11 +619,24 @@ class EVMTrader:
     def get_wrapped_native(self, chain: str) -> str:
         return WETH_ADDRESS if chain.upper() == "ETH" else WBNB_ADDRESS
 
-    async def get_balance(self, chain: str | None = None) -> float:
+    async def get_balance(self, chain: str | None = None, raise_on_error: bool = False) -> float:
         chain = chain or CHAIN
-        w3 = self.get_w3(chain)
-        balance_wei = await asyncio.to_thread(w3.eth.get_balance, self.wallet)
-        return float(w3.from_wei(balance_wei, "ether"))
+        try:
+            w3 = self.get_w3(chain)
+            balance_wei = await asyncio.to_thread(w3.eth.get_balance, self.wallet)
+            return float(w3.from_wei(balance_wei, "ether"))
+        except Exception as exc:
+            logger.error("EVM get_balance error for %s on %s: %s", self.wallet, chain, exc)
+            if raise_on_error:
+                raise
+            return 0.0
+
+    async def try_get_balance(self, chain: str | None = None) -> tuple[float, str | None]:
+        try:
+            return await self.get_balance(chain=chain, raise_on_error=True), None
+        except Exception as exc:
+            msg = str(exc) or getattr(exc, "error_msg", "") or repr(exc)
+            return 0.0, msg[:200]
 
     async def get_token_balance(self, token_address: str, chain: str | None = None) -> tuple[float, int]:
         chain = chain or CHAIN
@@ -717,6 +757,26 @@ class EVMTrader:
         except Exception as exc:
             logger.error("EVM buy_token error for %s: %s", token_address, exc)
             return None
+
+    async def buy_token_with_reason(self, token_address: str, amount_native: float, chain: str | None = None) -> dict:
+        chain = chain or CHAIN
+        bal, err = await self.try_get_balance(chain)
+        native = "ETH" if chain.upper() == "ETH" else "BNB"
+        if err:
+            return {"success": False, "reason": f"RPC error reading balance: {err[:120]}"}
+        fee_reserve = 0.005
+        if bal < amount_native + fee_reserve:
+            return {
+                "success": False,
+                "reason": (
+                    f"Insufficient balance — wallet has {bal:.6f} {native}, "
+                    f"need {amount_native + fee_reserve:.6f} {native} ({amount_native:.4f} buy + {fee_reserve} gas reserve)."
+                ),
+            }
+        result = await self.buy_token(token_address, chain=chain, amount_native=amount_native)
+        if result is None:
+            return {"success": False, "reason": "Swap failed — see logs (likely router error or RPC issue)."}
+        return {"success": True, **result}
 
     async def sell_token(self, token_address: str, chain: str | None = None, token_amount_raw: int = 0, decimals: int = 18) -> dict | None:
         chain = chain or CHAIN

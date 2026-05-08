@@ -5,6 +5,17 @@ import { useAuthStore } from '../store/authStore';
 
 const BOT_NAME = (import.meta.env.VITE_TELEGRAM_BOT_NAME || '').replace(/^@/, '');
 
+function extractErrorMessage(err: unknown): string {
+  const fallback = 'Failed to generate code. Try again.';
+  if (!(err instanceof Error) || !err.message) return fallback;
+  try {
+    const parsed = JSON.parse(err.message);
+    return parsed.detail || parsed.error || parsed.message || err.message;
+  } catch {
+    return err.message;
+  }
+}
+
 export default function BotLogin() {
   const navigate = useNavigate();
   const { setUser } = useAuthStore();
@@ -29,11 +40,7 @@ export default function BotLogin() {
       setCode(res.code);
       setExpiresAt(res.expires_at);
     } catch (err: unknown) {
-      const msg =
-        err instanceof Error && err.message
-          ? err.message
-          : 'Failed to generate code. Try again.';
-      setError(msg);
+      setError(extractErrorMessage(err));
     } finally {
       setLoading(false);
     }
@@ -95,12 +102,12 @@ export default function BotLogin() {
 
           {BOT_NAME && (
             <a
-              href={`https://t.me/${BOT_NAME}?start=login`}
+              href={`https://t.me/${BOT_NAME}?start=login_${code}`}
               target="_blank"
               rel="noopener noreferrer"
-              className="text-xs text-green/80 hover:text-green underline underline-offset-2"
+              className="w-full text-center px-4 py-2 rounded-lg bg-green/10 border border-green/20 text-green text-sm font-medium hover:bg-green/20 transition-colors"
             >
-              Open @{BOT_NAME} in Telegram
+              Open @{BOT_NAME} → tap Start to log in
             </a>
           )}
 

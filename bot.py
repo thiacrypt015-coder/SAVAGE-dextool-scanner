@@ -16,6 +16,7 @@ from solders.system_program import TransferParams, transfer
 from solders.transaction import Transaction
 from solders.message import Message
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.error import BadRequest
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler
 
 import db
@@ -91,6 +92,34 @@ def _is_admin(update) -> bool:
     return uid == TELEGRAM_CHAT_ID or uid in ADMIN_TELEGRAM_IDS
 
 
+def _format_balance_line(balance: float, error: str | None, native: str) -> str:
+    if error:
+        return f"⚠️ <b>Balance unavailable:</b> {error[:80]}\n   <i>Check RPC_URL_SOL configuration.</i>"
+    return f"Balance: {balance:.6f} {native}"
+
+
+def _ts_footer() -> str:
+    return f"\n<i>↻ {datetime.now(timezone.utc).strftime('%H:%M:%S UTC')}</i>"
+
+
+async def _user_balance(ut, chain: str | None = None) -> tuple[float, str | None]:
+    if ut is None:
+        return 0.0, None
+    if hasattr(ut, "try_get_balance"):
+        try:
+            if chain is not None:
+                return await ut.try_get_balance(chain)
+            return await ut.try_get_balance()
+        except TypeError:
+            return await ut.try_get_balance()
+    try:
+        if chain is not None:
+            return await ut.get_balance(chain), None
+        return await ut.get_balance(), None
+    except Exception as exc:
+        return 0.0, str(exc)[:200]
+
+
 async def _is_authorized(update) -> bool:
     if _is_admin(update):
         return True
@@ -135,10 +164,11 @@ async def _get_trading_wallet_balance_summary() -> tuple[int, float]:
         try:
             user_trader = await create_user_trader(uid)
             if user_trader:
-                if CHAIN.upper() == "SOL":
-                    total_wallet_balance += await user_trader.get_balance()
+                bal, err = await _user_balance(user_trader, None if CHAIN.upper() == "SOL" else CHAIN)
+                if err:
+                    logger.warning("Could not fetch wallet balance for user %d: %s", uid, err)
                 else:
-                    total_wallet_balance += await user_trader.get_balance(CHAIN)
+                    total_wallet_balance += bal
         except Exception as exc:
             logger.warning("Could not fetch wallet balance for user %d: %s", uid, exc)
     return len(trading_users), total_wallet_balance
@@ -405,6 +435,7 @@ async def cmd_help(update, context):
             lines.append("/backtest [days] — Replay scoring strategy against history")
             lines.append("/blacklist — Manage token blacklist")
             lines.append("/whitelist — Manage token whitelist")
+            lines.append("/diag — Deployment health check (DB, Redis, RPC, Telegram)")
             lines.append("")
             lines.append("<b>📊 Trading:</b>")
             lines.append("/dca — Dollar cost averaging (split buys)")
@@ -471,17 +502,62 @@ async def _start_scanner_tasks() -> bool:
 
 async def cmd_start(update, context):
     await _register_chat(update)
+
+    if context.args and len(context.args) == 1:
+        arg = context.args[0]
+        if arg.startswith("login_") or arg.startswith("login-"):
+            code = arg[len("login_"):].upper().strip()
+            user_id = update.effective_user.id
+            username = update.effective_user.username or update.effective_user.first_name or ""
+            is_admin_user = user_id in ADMIN_TELEGRAM_IDS or user_id == TELEGRAM_CHAT_ID
+            is_allowed = await db.is_user_allowed(user_id)
+            if not is_admin_user and not is_allowed:
+                await update.message.reply_html(
+                    "🔒 <b>Access Denied</b>\n\n"
+                    f"Your user ID: <code>{user_id}</code>\n"
+                    f"Ask the bot admin to run: <code>/adduser {user_id}</code>"
+                )
+                return
+            if not code:
+                await update.message.reply_text("Empty login code — generate a new one on the dashboard.")
+                return
+            result = await db.claim_login_code(code, user_id, username)
+            if result == 'ok':
+                await update.message.reply_html(
+                    "✅ <b>Dashboard login confirmed.</b>\n"
+                    "Return to the dashboard tab — you'll be logged in automatically."
+                )
+            elif result == 'expired':
+                await update.message.reply_html("⏰ That code has expired. Generate a new one on the dashboard.")
+            elif result == 'already_claimed':
+                await update.message.reply_html("⚠️ That code was already used. Generate a new one on the dashboard.")
+            else:
+                await update.message.reply_html("❌ Invalid code. Generate a new one on the dashboard.")
+            return
+
     if not _is_admin(update):
-        await update.message.reply_text("Admin only.")
+        uid = update.effective_user.id
+        is_allowed = await db.is_user_allowed(uid)
+        if is_allowed:
+            await update.message.reply_html(
+                "👋 <b>Welcome back to SAVAGE</b>\n\n"
+                "Use /help to see all commands, /wallet to see your address, /lowcaps for fresh signals."
+            )
+        else:
+            await update.message.reply_html(
+                "👋 <b>Welcome to SAVAGE</b>\n\n"
+                f"Your user ID: <code>{uid}</code>\n"
+                f"Ask the bot admin to run: <code>/adduser {uid}</code> to grant access."
+            )
         return
 
     newly_started = await _start_scanner_tasks()
 
     native = NATIVE_SYMBOL.get(CHAIN.upper(), "SOL")
-    if CHAIN.upper() == "SOL":
-        balance = await trader.get_balance()
-    else:
-        balance = await trader.get_balance(CHAIN)
+    balance, balance_err = await _user_balance(trader, None if CHAIN.upper() == "SOL" else CHAIN)
+    balance_line = (
+        f"Admin balance: ⚠️ {balance_err[:80]}" if balance_err else f"Admin balance: {balance:.4f} {native}"
+    )
 
     trading_user_count, total_wallet_balance = await _get_trading_wallet_balance_summary()
 
@@ -492,7 +568,7 @@ async def cmd_start(update, context):
         f"{header}\n\n"
         f"Scanner: {scanner_label}\n"
         f"Chain: {CHAIN}\n"
-        f"Admin balance: {balance:.4f} {native}\n"
+        f"{balance_line}\n"
         f"Trading wallets: {trading_user_count} | Balance: {total_wallet_balance:.4f} {native}\n"
         f"Alerts: {alert_status} (<code>/alerts on</code> or <code>/alerts off</code> controls broadcast)\n"
         f"Buy: {BUY_PERCENT}% | TP: {TAKE_PROFIT}% | Slippage: {SLIPPAGE}%\n"
@@ -729,7 +805,7 @@ async def cmd_wallet(update, context):
 
     native = NATIVE_SYMBOL.get(CHAIN.upper(), "SOL")
     ut = await create_user_trader(user_id)
-    balance = await ut.get_balance() if ut else 0.0
+    balance, err = await _user_balance(ut, None if CHAIN.upper() == "SOL" else CHAIN) if ut else (0.0, None)
     auto_trade = "✅ Enabled" if wallet_data.get("auto_trade", 1) else "❌ Disabled"
     at_state = "off" if wallet_data.get("auto_trade", 1) else "on"
     at_label = "⚙️ AutoTrade Off" if wallet_data.get("auto_trade", 1) else "⚙️ AutoTrade On"
@@ -745,13 +821,22 @@ async def cmd_wallet(update, context):
         ],
     ]
 
+    public_key = wallet_data["public_key"]
+    explorer_link = (
+        f'\n<a href="https://solscan.io/account/{public_key}">View on Solscan</a>'
+        if CHAIN.upper() == "SOL"
+        else ""
+    )
+
     await update.message.reply_html(
         f"👛 <b>Your Wallet</b>\n"
-        f"Address: <code>{wallet_data['public_key']}</code>\n"
-        f"Balance: {balance:.6f} {native}\n"
+        f"Address: <code>{public_key}</code>{explorer_link}\n"
+        f"{_format_balance_line(balance, err, native)}\n"
         f"Auto-Trade: {auto_trade}\n\n"
-        f"Send {native} to the address above to fund your trading wallet.",
+        f"Send {native} to the address above to fund your trading wallet."
+        f"{_ts_footer()}",
         reply_markup=InlineKeyboardMarkup(keyboard),
+        disable_web_page_preview=True,
     )
 
 
@@ -994,16 +1079,23 @@ async def cmd_balance(update, context):
         return
 
     native = NATIVE_SYMBOL.get(CHAIN.upper(), "SOL")
-    balance = await ut.get_balance()
+    balance, err = await _user_balance(ut, None if CHAIN.upper() == "SOL" else CHAIN)
     keyboard = [
         [
             InlineKeyboardButton("🔄 Refresh", callback_data="balance_refresh"),
             InlineKeyboardButton("👛 Wallet Details", callback_data="wallet_refresh"),
         ]
     ]
+    body = (
+        f"💰 <b>Wallet Balance</b> ({CHAIN})\n"
+        f"{_format_balance_line(balance, err, native)}\n"
+        f"👛 <code>{ut.wallet}</code>"
+        f"{_ts_footer()}"
+    )
     await update.message.reply_html(
-        f"💰 <b>Wallet Balance</b>\n{balance:.6f} {native} ({CHAIN})",
+        body,
         reply_markup=InlineKeyboardMarkup(keyboard),
+        disable_web_page_preview=True,
     )
 
 
@@ -1222,6 +1314,14 @@ async def cmd_buy(update, context):
     token_address = context.args[0].strip()
     native = NATIVE_SYMBOL.get(CHAIN.upper(), "SOL")
 
+    bal, balance_err = await _user_balance(user_trader, None if CHAIN.upper() == "SOL" else CHAIN)
+    if balance_err:
+        await update.message.reply_html(
+            f"⚠️ <b>Cannot read wallet balance</b>\n<code>{balance_err[:160]}</code>\n"
+            f"Check RPC_URL_SOL configuration in your environment."
+        )
+        return
+
     if len(context.args) >= 2:
         try:
             buy_amount = float(context.args[1])
@@ -1235,7 +1335,19 @@ async def cmd_buy(update, context):
         buy_amount = await user_trader.get_buy_amount()
 
     if buy_amount <= 0:
-        await update.message.reply_text(f"Insufficient {native} balance.")
+        await update.message.reply_html(
+            f"Insufficient {native} balance — wallet has {bal:.6f} {native}.\n"
+            f"Address: <code>{user_trader.wallet}</code>"
+        )
+        return
+
+    fee_reserve = 0.005
+    if bal < buy_amount + fee_reserve:
+        await update.message.reply_html(
+            f"⚠️ <b>Insufficient balance</b>\n"
+            f"Wallet has {bal:.6f} {native}, need {buy_amount + fee_reserve:.6f} {native} "
+            f"({buy_amount:.4f} buy + {fee_reserve} fee reserve)."
+        )
         return
 
     already = await db.is_token_already_bought(token_address, CHAIN.upper(), user_id)
@@ -2067,9 +2179,17 @@ async def post_init(application):
 
     await db.init_db()
 
-    from config import ALERT_BROADCAST, RPC_URLS_SOL
+    from config import ALERT_BROADCAST, RPC_URLS_SOL, RPC_URL_SOL_REWRITTEN, _mask_rpc_url
     alerts_enabled = ALERT_BROADCAST
     logger.info("Configured %d Solana RPC endpoint(s)", len(RPC_URLS_SOL))
+    if RPC_URLS_SOL:
+        logger.info("Primary RPC: %s", _mask_rpc_url(RPC_URLS_SOL[0]))
+    if RPC_URL_SOL_REWRITTEN:
+        logger.warning(
+            "RPC_URL_SOL was auto-fixed at startup — original env value used a malformed Helius URL. "
+            "Update the env var to %s for clarity.",
+            ",".join(RPC_URLS_SOL),
+        )
 
     trader = create_trader(CHAIN)
     notifier = Notifier(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID)
@@ -2302,10 +2422,14 @@ async def _handle_buy_confirm_callback(query, user_id, token_prefix, amount):
         f"🔄 Executing buy of {amount:.4f} {native}...",
     )
 
-    result = await user_trader.buy_token(token_address, amount)
-    if result is None:
-        await query.edit_message_text("❌ Buy failed. Check logs for details.")
-        logger.error("Inline buy failed for %s (user %d)", token_address, user_id)
+    result = await user_trader.buy_token_with_reason(token_address, amount)
+    if not result.get("success"):
+        reason = result.get("reason", "Unknown error")
+        logger.error("Inline buy failed for %s (user %d): %s", token_address, user_id, reason)
+        await query.edit_message_text(
+            f"❌ <b>Buy failed</b>\n<code>{reason}</code>",
+            parse_mode="HTML",
+        )
         return
 
     symbol = result.get("symbol", token_address[:8])
@@ -2398,9 +2522,14 @@ async def _handle_quickbuy_callback(query, user_id, token_prefix, amount):
     native = NATIVE_SYMBOL.get(CHAIN.upper(), "SOL")
     await query.answer(f"Buying {amount} {native} of {symbol}...")
 
-    result = await user_trader.buy_token(token_address, amount)
-    if result is None:
-        await notifier.send_to_user(user_id, f"❌ Quick buy failed for {symbol}")
+    result = await user_trader.buy_token_with_reason(token_address, amount)
+    if not result.get("success"):
+        reason = result.get("reason", "Unknown error")
+        logger.error("Quick buy failed for %s (user %d): %s", token_address, user_id, reason)
+        await notifier.send_to_user(
+            user_id,
+            f"❌ <b>Quick buy failed</b> for {symbol}\n<code>{reason}</code>",
+        )
         return
 
     entry_liq = 0.0
@@ -2443,7 +2572,7 @@ async def _handle_quickbuy_callback(query, user_id, token_prefix, amount):
 async def _handle_status_refresh(query, user_id):
     positions = await monitor.get_positions_with_roi(user_id=user_id)
     if not positions:
-        await query.edit_message_text("No open positions.")
+        await query.edit_message_text(f"No open positions.{_ts_footer()}", parse_mode="HTML")
         return
 
     native = NATIVE_SYMBOL.get(CHAIN.upper(), "SOL")
@@ -2467,6 +2596,7 @@ async def _handle_status_refresh(query, user_id):
             InlineKeyboardButton(f"💰 Sell 100%", callback_data=f"sell:{tp}:100"),
         ])
     keyboard.append([InlineKeyboardButton("🔄 Refresh Positions", callback_data="status_refresh")])
+    lines.append(_ts_footer())
 
     await query.edit_message_text(
         "\n".join(lines),
@@ -2484,7 +2614,7 @@ async def _handle_wallet_refresh(query, user_id):
 
     native = NATIVE_SYMBOL.get(CHAIN.upper(), "SOL")
     ut = await create_user_trader(user_id)
-    balance = await ut.get_balance() if ut else 0.0
+    balance, err = await _user_balance(ut, None if CHAIN.upper() == "SOL" else CHAIN) if ut else (0.0, None)
     auto_trade = "✅ Enabled" if wallet_data.get("auto_trade", 1) else "❌ Disabled"
     at_state = "off" if wallet_data.get("auto_trade", 1) else "on"
     at_label = "⚙️ AutoTrade Off" if wallet_data.get("auto_trade", 1) else "⚙️ AutoTrade On"
@@ -2500,12 +2630,20 @@ async def _handle_wallet_refresh(query, user_id):
         ],
     ]
 
+    public_key = wallet_data["public_key"]
+    explorer_link = (
+        f'\n<a href="https://solscan.io/account/{public_key}">View on Solscan</a>'
+        if CHAIN.upper() == "SOL"
+        else ""
+    )
+
     await query.edit_message_text(
         f"👛 <b>Your Wallet</b>\n"
-        f"Address: <code>{wallet_data['public_key']}</code>\n"
-        f"Balance: {balance:.6f} {native}\n"
+        f"Address: <code>{public_key}</code>{explorer_link}\n"
+        f"{_format_balance_line(balance, err, native)}\n"
         f"Auto-Trade: {auto_trade}\n\n"
-        f"Send {native} to the address above to fund your trading wallet.",
+        f"Send {native} to the address above to fund your trading wallet."
+        f"{_ts_footer()}",
         parse_mode="HTML",
         disable_web_page_preview=True,
         reply_markup=InlineKeyboardMarkup(keyboard),
@@ -2519,15 +2657,21 @@ async def _handle_balance_refresh(query, user_id):
         return
 
     native = NATIVE_SYMBOL.get(CHAIN.upper(), "SOL")
-    balance = await ut.get_balance()
+    balance, err = await _user_balance(ut, None if CHAIN.upper() == "SOL" else CHAIN)
     keyboard = [
         [
             InlineKeyboardButton("🔄 Refresh", callback_data="balance_refresh"),
             InlineKeyboardButton("👛 Wallet Details", callback_data="wallet_refresh"),
         ]
     ]
+    body = (
+        f"💰 <b>Wallet Balance</b> ({CHAIN})\n"
+        f"{_format_balance_line(balance, err, native)}\n"
+        f"👛 <code>{ut.wallet}</code>"
+        f"{_ts_footer()}"
+    )
     await query.edit_message_text(
-        f"💰 <b>Wallet Balance</b>\n{balance:.6f} {native} ({CHAIN})",
+        body,
         parse_mode="HTML",
         disable_web_page_preview=True,
         reply_markup=InlineKeyboardMarkup(keyboard),
@@ -2541,7 +2685,7 @@ async def _handle_portfolio_refresh(query, user_id):
         return
 
     native = NATIVE_SYMBOL.get(CHAIN.upper(), "SOL")
-    wallet_balance = await ut.get_balance()
+    wallet_balance, balance_err = await _user_balance(ut, None if CHAIN.upper() == "SOL" else CHAIN)
     positions = await monitor.get_positions_with_roi(user_id=user_id)
 
     total_invested = 0.0
@@ -2602,9 +2746,15 @@ async def _handle_portfolio_refresh(query, user_id):
         "💼 <b>PORTFOLIO OVERVIEW</b>",
         "━━━━━━━━━━━━━━━━━━━━━━",
         "",
-        f"💰 Wallet: {wallet_balance:.4f} {native}",
-        f"📦 In Positions: {total_current_value:.4f} {native}",
-        f"📊 Total Value: {total_portfolio:.4f} {native}",
+    ]
+    if balance_err:
+        msg_parts.append(_format_balance_line(wallet_balance, balance_err, native))
+        msg_parts.append(f"📦 In Positions: {total_current_value:.4f} {native}")
+    else:
+        msg_parts.append(f"💰 Wallet: {wallet_balance:.4f} {native}")
+        msg_parts.append(f"📦 In Positions: {total_current_value:.4f} {native}")
+        msg_parts.append(f"📊 Total Value: {total_portfolio:.4f} {native}")
+    msg_parts.extend([
         "",
         "<b>PnL Summary</b>",
         f"   Unrealized: {unrealized_sign}{unrealized_pnl:.4f} {native}",
@@ -2615,7 +2765,7 @@ async def _handle_portfolio_refresh(query, user_id):
         f"   Open Positions: {len(positions)}",
         f"   Completed Trades: {total_trades}",
         f"   Win Rate: {win_rate:.1f}%",
-    ]
+    ])
     if position_lines:
         msg_parts.append("")
         msg_parts.append("━━━━━━━━━━━━━━━━━━━━━━")
@@ -2626,6 +2776,7 @@ async def _handle_portfolio_refresh(query, user_id):
     else:
         msg_parts.append("")
         msg_parts.append("No open positions.")
+    msg_parts.append(_ts_footer())
 
     keyboard = [[InlineKeyboardButton("🔄 Refresh Portfolio", callback_data="portfolio_refresh")]]
     await query.edit_message_text(
@@ -2697,7 +2848,7 @@ async def _handle_autotrade_callback(query, user_id, state):
 
     native = NATIVE_SYMBOL.get(CHAIN.upper(), "SOL")
     ut = await create_user_trader(user_id)
-    balance = await ut.get_balance() if ut else 0.0
+    balance, err = await _user_balance(ut, None if CHAIN.upper() == "SOL" else CHAIN) if ut else (0.0, None)
     auto_trade = "✅ Enabled" if enable else "❌ Disabled"
     at_state = "off" if enable else "on"
     at_label = "⚙️ AutoTrade Off" if enable else "⚙️ AutoTrade On"
@@ -2713,12 +2864,20 @@ async def _handle_autotrade_callback(query, user_id, state):
         ],
     ]
 
+    public_key = wallet_data["public_key"]
+    explorer_link = (
+        f'\n<a href="https://solscan.io/account/{public_key}">View on Solscan</a>'
+        if CHAIN.upper() == "SOL"
+        else ""
+    )
+
     await query.edit_message_text(
         f"👛 <b>Your Wallet</b>\n"
-        f"Address: <code>{wallet_data['public_key']}</code>\n"
-        f"Balance: {balance:.6f} {native}\n"
+        f"Address: <code>{public_key}</code>{explorer_link}\n"
+        f"{_format_balance_line(balance, err, native)}\n"
         f"Auto-Trade: {auto_trade}\n\n"
-        f"Send {native} to the address above to fund your trading wallet.",
+        f"Send {native} to the address above to fund your trading wallet."
+        f"{_ts_footer()}",
         parse_mode="HTML",
         disable_web_page_preview=True,
         reply_markup=InlineKeyboardMarkup(keyboard),
@@ -2887,7 +3046,7 @@ async def handle_callback(update, context):
                 ],
             ]
             await query.edit_message_text(
-                msg, parse_mode="HTML", disable_web_page_preview=True,
+                msg + _ts_footer(), parse_mode="HTML", disable_web_page_preview=True,
                 reply_markup=InlineKeyboardMarkup(keyboard),
             )
 
@@ -2905,13 +3064,13 @@ async def handle_callback(update, context):
             stats_30d = await db.get_trade_stats(user_id=user_id, days=30)
 
             if stats_all["total_trades"] == 0:
-                await query.edit_message_text("No completed trades to analyze.")
+                await query.edit_message_text(f"No completed trades to analyze.{_ts_footer()}", parse_mode="HTML")
                 return
 
             msg = _format_stats_message(stats_all, stats_7d, stats_30d, native, "📊 YOUR TRADING STATS")
             keyboard = [[InlineKeyboardButton("🔄 Refresh Stats", callback_data="stats_refresh")]]
             await query.edit_message_text(
-                msg,
+                msg + _ts_footer(),
                 parse_mode="HTML",
                 disable_web_page_preview=True,
                 reply_markup=InlineKeyboardMarkup(keyboard),
@@ -2944,6 +3103,7 @@ async def handle_callback(update, context):
                     InlineKeyboardButton(f"🛒 Buy 0.5 SOL", callback_data=f"quickbuy:{tp}:0.5"),
                 ])
             keyboard.append([InlineKeyboardButton("🔄 Refresh", callback_data="lowcaps_refresh")])
+            lines.append(_ts_footer())
 
             await query.edit_message_text(
                 "\n".join(lines),
@@ -2984,10 +3144,23 @@ async def handle_callback(update, context):
         else:
             logger.warning("Unknown callback data: %s", data)
 
+    except BadRequest as exc:
+        msg_str = str(exc).lower()
+        if "not modified" in msg_str or "message is not modified" in msg_str:
+            try:
+                await query.answer("✓ Already up to date")
+            except Exception:
+                pass
+        else:
+            logger.error("Callback BadRequest (data=%s, user=%d): %s", data, user_id, exc)
+            try:
+                await query.answer(f"⚠️ {str(exc)[:180]}", show_alert=True)
+            except Exception:
+                pass
     except Exception as exc:
-        logger.error("Callback error (data=%s, user=%d): %s", data, user_id, exc)
+        logger.exception("Callback error (data=%s, user=%d)", data, user_id)
         try:
-            await query.edit_message_text(f"❌ Error: {str(exc)[:200]}")
+            await query.answer("⚠️ Something went wrong — try again or check logs.", show_alert=True)
         except Exception:
             pass
 
@@ -3042,6 +3215,9 @@ async def cmd_login(update, context):
         return
 
     code = context.args[0].upper().strip()
+    if len(code) < 4 or len(code) > 12:
+        await update.message.reply_text("❌ Invalid code format.")
+        return
 
     is_admin_user = user_id in ADMIN_TELEGRAM_IDS
     is_allowed = await db.is_user_allowed(user_id)
@@ -3924,6 +4100,85 @@ async def cmd_orders(update, context):
     await update.message.reply_html("\n".join(lines))
 
 
+async def cmd_diag(update, context):
+    await _register_chat(update)
+    if not _is_admin(update):
+        await update.message.reply_text("Admin only.")
+        return
+
+    import os
+    import time as _t
+    from urllib.parse import urlparse
+
+    lines = ["🩺 <b>SAVAGE Diagnostics</b>\n"]
+
+    try:
+        db_url = os.getenv("DATABASE_URL", "")
+        if db_url:
+            parsed = urlparse(db_url)
+            db_host_safe = f"{parsed.hostname}:{parsed.port}/{(parsed.path or '/').lstrip('/')}"
+        else:
+            db_host_safe = "(unset)"
+        users = await db.get_all_trading_users()
+        wallet_count = await db._fetchval('SELECT COUNT(*) FROM user_wallets')
+        login_codes = await db._fetchval('SELECT COUNT(*) FROM dashboard_login_codes')
+        lines.append(f"✅ <b>DB:</b> {db_host_safe}")
+        lines.append(f"   wallets={wallet_count} | trading={len(users)} | login_codes={login_codes}")
+    except Exception as exc:
+        lines.append(f"❌ <b>DB error:</b> {str(exc)[:120]}")
+
+    try:
+        import redis.asyncio as _r
+        url = os.getenv("REDIS_URL", "")
+        if url:
+            client = _r.from_url(url, socket_timeout=3, socket_connect_timeout=3)
+            t0 = _t.monotonic()
+            await client.ping()
+            ms = int((_t.monotonic() - t0) * 1000)
+            await client.aclose()
+            parsed = urlparse(url)
+            lines.append(f"✅ <b>Redis:</b> {parsed.hostname}:{parsed.port} ({ms}ms)")
+        else:
+            lines.append("⚠️ <b>Redis:</b> not configured")
+    except Exception as exc:
+        lines.append(f"❌ <b>Redis error:</b> {str(exc)[:120]}")
+
+    try:
+        from config import RPC_URLS_SOL, _mask_rpc_url
+        rpc_count = len(RPC_URLS_SOL)
+        first_rpc = RPC_URLS_SOL[0] if RPC_URLS_SOL else ""
+        masked = _mask_rpc_url(first_rpc)
+        t0 = _t.monotonic()
+        if hasattr(trader, 'try_get_balance'):
+            bal, err = await trader.try_get_balance()
+        else:
+            try:
+                bal = await trader.get_balance()
+                err = None
+            except Exception as exc:
+                bal = 0.0
+                err = str(exc)[:160]
+        ms = int((_t.monotonic() - t0) * 1000)
+        if err:
+            lines.append(f"❌ <b>Solana RPC ({rpc_count} endpoint(s)):</b> {err[:120]}")
+        else:
+            lines.append(f"✅ <b>Solana RPC ({rpc_count} endpoint(s)):</b> {ms}ms — admin balance {bal:.6f} SOL")
+        lines.append(f"   <code>{masked[:120]}</code>")
+    except Exception as exc:
+        lines.append(f"❌ <b>Solana RPC error:</b> {str(exc)[:120]}")
+
+    try:
+        me = await context.bot.get_me()
+        lines.append(f"✅ <b>Telegram:</b> @{me.username} (id={me.id})")
+    except Exception as exc:
+        lines.append(f"❌ <b>Telegram error:</b> {str(exc)[:120]}")
+
+    lines.append(f"\n🔁 Scanner: {'🟢 running' if is_running else '🔴 stopped'} | Alerts: {'on' if alerts_enabled else 'off'}")
+    lines.append(f"⛓ Chain: {CHAIN} | Min liq: ${MIN_LIQUIDITY:,} | MCap: ${MIN_MCAP:,}–${MAX_MCAP:,}")
+
+    await update.message.reply_html("\n".join(lines))
+
+
 def main():
     logger.info("Starting DexTool Scanner Bot …")
 
@@ -3975,6 +4230,7 @@ def main():
     app.add_handler(CommandHandler("orders", cmd_orders))
     app.add_handler(CommandHandler("pnl", cmd_pnl))
     app.add_handler(CommandHandler("compound", cmd_compound))
+    app.add_handler(CommandHandler("diag", cmd_diag))
     app.add_handler(CallbackQueryHandler(handle_callback))
 
     def _handle_signal(signum, frame):

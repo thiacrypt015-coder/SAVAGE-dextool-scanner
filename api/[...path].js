@@ -30,8 +30,9 @@ module.exports = async function handler(req, res) {
 
   if (!backendUrl) {
     return res.status(500).json({
-      error:
-        'No backend URL configured. Set the BACKEND_URL environment variable in Vercel project settings.',
+      error: 'No backend URL configured.',
+      detail:
+        'Set the BACKEND_URL environment variable in Vercel project settings to your FastAPI backend URL (e.g. https://savage-backend.up.railway.app). Then redeploy.',
     });
   }
 
