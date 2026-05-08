@@ -94,7 +94,7 @@ def _is_admin(update) -> bool:
 
 def _format_balance_line(balance: float, error: str | None, native: str) -> str:
     if error:
-        return f"⚠️ <b>Balance unavailable:</b> {error[:80]}\n   <i>Check RPC_URL_SOL configuration.</i>"
+        return f"⚠️ <b>Balance unavailable:</b> {error[:80]}\n   <i>Check RPC configuration.</i>"
     return f"Balance: {balance:.6f} {native}"
 
 
